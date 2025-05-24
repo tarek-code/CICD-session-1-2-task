@@ -1,0 +1,165 @@
+stages:
+  - install_dependencies
+  - build
+  - eslint-jest-test
+  - sast
+  - dependencies_scan
+  - deploy
+  - tarek-dast
+  - cleanup
+  - notify
+ 
+install_dependencies:
+  tags:
+    - docker 
+  stage: install_dependencies
+  image:
+    name: node:latest
+    entrypoint: [""]
+  script:
+    - npm ci
+  cache:
+    paths:
+      - node_modules/
+  artifacts:
+    paths:
+      - node_modules/
+    
+
+build:
+  tags:
+    - docker
+  dependencies:
+    - install_dependencies
+  stage: build
+  image:
+    name: node:latest
+    entrypoint: [""]
+  script:
+    - npm run build
+  artifacts:
+    paths:
+      - build/
+
+
+eslint-jest-test:
+  tags:
+    - docker
+  stage: eslint-jest-test
+  image:
+    name: node:latest
+    entrypoint: [""]
+  script:
+    - npx eslint . --fix -f json -o test-report.json || true
+    - cat test-report.json
+    - npx jest --json --outputFile=jest-report.json --ci
+  artifacts:
+    when: always
+    paths:
+      - test-report.json
+      - jest-report.json
+
+ 
+sast:
+  tags:
+    - docker
+  stage: sast
+  artifacts:
+    paths:
+      - gl-sast-report.json
+
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+synk_scan:
+  tags:
+    - docker
+  stage: dependencies_scan
+  script:
+    - npm install -g snyk
+    - snyk auth $SNYK_TOKEN
+    - snyk test --json > snyk-report.json || true
+    - snyk monitor 
+  artifacts:
+    when: always
+    paths:
+      - snyk-report.json
+
+
+docker_build_push:
+  stage: deploy
+  tags:
+    - docker
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  dependencies:
+    - build
+  script:
+    - docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD"
+    - docker build -t $DOCKER_USERNAME/react-app .
+    - docker tag $DOCKER_USERNAME/react-app $DOCKER_HUB_REPO:latest
+    - docker tag $DOCKER_USERNAME/react-app $DOCKER_HUB_REPO:$CI_COMMIT_SHORT_SHA
+    - docker push $DOCKER_HUB_REPO:latest
+    - docker push $DOCKER_HUB_REPO:$CI_COMMIT_SHORT_SHA
+
+  only:
+    - main
+
+
+tarek-dast:
+  tags:
+    - docker
+  stage: tarek-dast
+  image:
+    name: docker:latest
+    entrypoint: [""]
+  services:
+    - name: docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - mkdir -p zap-wrk
+    - chmod 777 zap-wrk
+    - docker network inspect zapnet || docker network create zapnet
+    - docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD"
+    - docker pull $DOCKER_HUB_REPO:latest
+    - docker run -d --rm --name tarek-react-app --network zapnet $DOCKER_HUB_REPO:latest
+    - for i in {1..30}; do curl -f http://tarek-react-app && break || (echo "Waiting for app..."; sleep 2); done
+    - docker run --rm -v $(pwd)/zap-wrk:/zap/wrk --network zapnet zaproxy/zap-stable zap-baseline.py -t "http://tarek-react-app" -g gen.conf -r report.html -w report.md -J report.json || true
+    - cp zap-wrk/report.html zap-wrk/report.md zap-wrk/report.json . || true
+
+  artifacts:
+    when: always
+    paths:
+      - report.html
+      - report.md
+      - report.json
+
+
+cleanup:
+  tags:
+    - docker
+  stage: cleanup
+  image: alpine:latest
+  script:
+    - echo " Clean workspace"
+    - rm -rf build/ zap-wrk/ node_modules/
+    - rm -f test-report.json jest-report.json snyk-report.json report.html report.md report.json image.tar || true
+  when: always
+
+slack-notify:
+  tags:
+    - docker
+  dependencies:
+    - docker_build_push
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+     curl -X POST -H 'Content-type: application/json' --data '{"text": "The task Q2 CI/CD with DevSecOps for RRACT Application Using GitLab has been completed successfully"}' $SLACK_WEBHOOK_URL
+  
