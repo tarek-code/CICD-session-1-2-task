@@ -1,0 +1,189 @@
+stages:
+  - build   
+  - test
+  - sast
+  - dependancy-scan
+  - container-build
+  - container-scan
+  - deploy
+  - tarek-dast
+  - cleanup
+  - notify
+
+ 
+build:
+  tags:
+    - docker
+  stage: build  
+  image: maven:3.9.6-eclipse-temurin-17 
+  script:
+    - mvn clean package -DskipTests  
+  artifacts:
+    paths:
+      - target/*.jar  
+
+test:
+  tags:
+    - docker
+  dependencies:
+    - build
+  stage: test
+  image: maven:3.9.6-eclipse-temurin-17
+  script:
+    - mvn test
+  artifacts:
+    when: always
+    reports:
+      junit: target/surefire-reports/TEST-*.xml 
+
+variables:
+  SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+  GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+sonarcloud-check:
+  tags:
+    - docker
+  dependencies:
+    - test
+  stage: sast
+  image: maven:3.9.6-eclipse-temurin-17
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script:
+      - mvn verify sonar:sonar -Dsonar.projectKey=tarek_tarek
+  only:
+    - merge_requests
+    - main
+    - develop
+
+
+
+dependency-check:
+  tags:
+    - docker
+  dependencies:
+    - build
+  stage: dependancy-scan
+  image:
+    name: owasp/dependency-check:latest
+    entrypoint: [""]
+  script:
+    - /usr/share/dependency-check/bin/dependency-check.sh --project "TarekProject" --scan "${CI_PROJECT_DIR}" --format "HTML" --out "${CI_PROJECT_DIR}/dependency-check-report"
+  artifacts:
+    when: always
+    paths:
+      - dependency-check-report
+
+
+docker-build:
+  tags:
+    - docker
+  dependencies:
+    - build
+  stage: container-build
+  image: docker:latest
+  services:
+    - name: docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA .
+    - docker save $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA -o image.tar
+  artifacts:
+    paths:
+      - image.tar
+
+docker-scan:
+  tags:
+    - docker
+  dependencies:
+    - docker-build
+  stage: container-scan
+  image:
+    name: aquasec/trivy:latest
+    entrypoint: [""]
+  script:
+    - trivy image --input image.tar --format template --template "@/contrib/html.tpl" --output trivy-report.html
+    - trivy image --input image.tar --severity HIGH,CRITICAL --exit-code 1 || echo "There are high severity vulnerabilities"
+  artifacts:
+    when: always
+    paths:
+      - trivy-report.html
+
+deploy:
+  tags:
+    - docker
+  dependencies:
+    - docker-build
+  stage: deploy
+  image: docker:latest
+  services:
+    - docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - docker load -i image.tar
+    - docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD"
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA $DOCKER_HUB_REPO:latest
+    - docker tag $CI_REGISTRY_IMAGE:$CI_COMMIT_REF_SLUG-$CI_COMMIT_SHORT_SHA $DOCKER_HUB_REPO:$CI_COMMIT_SHORT_SHA
+    - docker push $DOCKER_HUB_REPO:latest
+    - docker push $DOCKER_HUB_REPO:$CI_COMMIT_SHORT_SHA
+
+
+    
+tarek-dast:
+  tags:
+    - docker
+  dependencies:
+    - docker-build
+  stage: tarek-dast
+  image:
+    name: docker:latest
+    entrypoint: [""]
+  services:
+    - name: docker:dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  script:
+    - mkdir -p zap-wrk
+    - chmod 777 zap-wrk
+    - docker login -u "$DOCKER_USERNAME" -p "$DOCKER_PASSWORD"
+    - docker pull $DOCKER_HUB_REPO:latest
+    - docker run -d --name tarek-dast -p 8080:8080 $DOCKER_HUB_REPO:latest
+    - sleep 5 && docker inspect tarek-dast --format '{{.State.ExitCode}}'
+    - for i in {1..60}; do docker exec tarek-dast curl -f http://localhost:8080 && break || (echo "Waiting for app..."; docker logs tarek-dast; sleep 2); done
+    - docker run -v $(pwd)/zap-wrk:/zap/wrk --network container:tarek-dast zaproxy/zap-stable zap-baseline.py -t "http://localhost:8080" -g gen.conf -r report.html -w report.md -J report.json || true
+    - cp zap-wrk/report.html zap-wrk/report.md zap-wrk/report.json . || true
+  artifacts:
+    when: always
+    paths:
+      - report.html
+      - report.md
+      - report.json
+
+
+
+cleanup:
+  tags:
+    - docker
+  stage: cleanup
+  image: alpine:latest
+  script:
+    - echo "Cleaning up..."
+    - rm -f image.tar
+
+
+slack-notify:
+  tags:
+    - docker
+  dependencies:
+    - deploy
+  stage: notify
+  image: curlimages/curl:latest
+  script:
+    - |
+     curl -X POST -H 'Content-type: application/json' --data '{"text": "The task Q1 CI/CD with DevSecOps for Spring Boot Application Using GitLab has been completed successfully"}' $SLACK_WEBHOOK_URL
